@@ -155,3 +155,15 @@ test("assign deals out different animations", () => {
   assert.equal(new Set(ids).size, 4);
   assert.equal(plain(Clawd.assign(40, random)).length, 40);
 });
+
+test("lists QML hands back count as lists", () => {
+  // A QML sequence wrapper is array-like but not an Array.
+  const wrapper = { length: 2, 0: { id: "a", provider: "claude", menuText: "1%" }, 1: { id: "b", provider: "claude", menuText: "2%" } };
+  assert.equal(Model.isList(wrapper), true);
+  assert.equal(Model.isList("text"), false);
+  assert.equal(Model.isList(null), false);
+  const before = Model.segments([{ id: "a", provider: "claude", menuText: "1%" }]);
+  const after = Model.segments([{ id: "a", provider: "claude", menuText: "5%" }]);
+  const asWrapper = (list) => Object.assign({ length: list.length }, list);
+  assert.deepEqual(plain(Model.changedClaudeSegments(asWrapper(before), asWrapper(after))), [0]);
+});

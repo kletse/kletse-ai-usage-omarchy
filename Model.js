@@ -4,6 +4,16 @@
 // account's headline and bar text; this only turns numbers into what the panel shows. Pure
 // functions, so tests can run them in Node.
 
+// A JS array, or a list QML hands back from a property or a model (a sequence wrapper, for
+// which Array.isArray is false).
+function isList(value) {
+  return Array.isArray(value) || (!!value && typeof value === "object" && typeof value.length === "number")
+}
+
+function toList(value) {
+  return isList(value) ? value : []
+}
+
 // Below 75% a meter is normal, from 75% a warning, and from 90% critical.
 function level(percent) {
   var value = Number(percent)
@@ -64,7 +74,7 @@ function metaLine(snapshot) {
 // The bar's content in config order: one segment per account and a separator between groups.
 function segments(accounts) {
   var out = []
-  var list = Array.isArray(accounts) ? accounts : []
+  var list = toList(accounts)
   for (var i = 0; i < list.length; i++) {
     var entry = list[i] || {}
     if (i > 0 && (entry.group || null) !== ((list[i - 1] || {}).group || null)) out.push({ kind: "separator", key: "sep-" + i })
@@ -84,7 +94,7 @@ function segments(accounts) {
 // mascots can celebrate. Only meaningful while the account list keeps its shape.
 function changedClaudeSegments(previous, next) {
   var out = []
-  if (!Array.isArray(previous) || !Array.isArray(next) || previous.length !== next.length) return out
+  if (!isList(previous) || !isList(next) || previous.length !== next.length) return out
   for (var i = 0; i < next.length; i++) {
     var a = previous[i], b = next[i]
     if (!a || !b || a.kind !== "account" || b.kind !== "account") continue
@@ -121,7 +131,7 @@ function parseStatus(text) {
     return null
   }
   if (!data || typeof data !== "object" || data.version !== 1) return null
-  if (!Array.isArray(data.accounts)) data.accounts = []
+  if (!isList(data.accounts)) data.accounts = []
   data.accounts = data.accounts.filter(function(entry) { return entry && typeof entry === "object" })
   return data
 }

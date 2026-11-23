@@ -1,0 +1,51 @@
+#!/bin/bash
+# Renders the README images from made-up accounts, offscreen: docs/panel.png, docs/bar.gif and
+# docs/animations.gif. It uses the widget's own QML, a stock Omarchy theme and a throwaway HOME,
+# so none of your accounts, logins or theme end up in them.
+#
+#   scripts/render-docs [theme]      default: tokyo-night; SCALE=2 sets the pixel density
+set -euo pipefail
+
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+OMARCHY="${OMARCHY_PATH:-/usr/share/omarchy}"
+THEME="${1:-tokyo-night}"
+THEME_DIR="$OMARCHY/themes/$THEME"
+
+[[ -d $THEME_DIR ]] || { echo "render-docs: no theme '$THEME' in $OMARCHY/themes" >&2; exit 1; }
+for tool in quickshell magick python3; do
+  command -v "$tool" >/dev/null || { echo "render-docs: needs $tool" >&2; exit 1; }
+done
+
+work="$(mktemp -d)"
+trap 'rm -rf "$work"' EXIT
+config="$work/config" home="$work/home" out="$work/out"
+mkdir -p "$config" "$home/.local/state/omarchy/current" "$out"
+ln -s "$OMARCHY/shell/Commons" "$config/Commons"
+ln -s "$OMARCHY/shell/Ui" "$config/Ui"
+ln -s "$REPO" "$config/widget"
+cp "$REPO/scripts/render/shell.qml" "$config/shell.qml"
+ln -s "$THEME_DIR" "$home/.local/state/omarchy/current/theme"
+python3 "$REPO/bin/ai-usage" sample >"$work/sample.json"
+wallpaper="$(find "$THEME_DIR/backgrounds" -maxdepth 1 -type f 2>/dev/null | sort | head -n 1 || true)"
+
+# A clean environment: no compositor, no Hyprland, nothing from your session.
+env -i PATH="$PATH" LANG=C.UTF-8 HOME="$home" XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-$work}" \
+  XDG_CONFIG_HOME="$home/.config" XDG_STATE_HOME="$home/.local/state" XDG_DATA_HOME="$home/.local/share" \
+  XDG_CACHE_HOME="$work/cache" QT_QPA_PLATFORM=offscreen QT_SCALE_FACTOR="${SCALE:-2}" \
+  AI_USAGE_SAMPLE="$work/sample.json" AI_USAGE_RENDER_DIR="$out" AI_USAGE_RENDER_WALLPAPER="$wallpaper" \
+  quickshell -p "$config/shell.qml" >/dev/null 2>&1 &
+pid=$!
+for _ in $(seq 1 240); do
+  [[ -f $out/done.png ]] && break
+  kill -0 "$pid" 2>/dev/null || break
+  sleep 0.5
+done
+kill "$pid" 2>/dev/null || true
+wait "$pid" 2>/dev/null || true
+[[ -f $out/done.png ]] || { echo "render-docs: rendering failed; \`quickshell log\` shows why" >&2; exit 1; }
+
+mkdir -p "$REPO/docs"
+cp "$out/panel.png" "$REPO/docs/panel.png"
+magick -delay 1x30 -loop 0 "$out"/bar-*.png -layers Optimize "$REPO/docs/bar.gif"
+magick -delay 1x30 -loop 0 "$out"/grid-*.png -layers Optimize "$REPO/docs/animations.gif"
+echo "Wrote docs/panel.png, docs/bar.gif and docs/animations.gif"

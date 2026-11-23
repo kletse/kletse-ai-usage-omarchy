@@ -4,6 +4,11 @@ An [Omarchy](https://omarchy.org/) bar widget that shows how much of your **Clau
 **Codex** subscription limits you've used, for **several accounts at once**. It is the Omarchy
 port of [kletse-ai-usage-macos](https://github.com/kletse/kletse-ai-usage-macos).
 
+<p align="center">
+  <img src="docs/bar.gif" alt="The widget in the bar showing four accounts, with the Claude mascots animating" width="452"><br><br>
+  <img src="docs/panel.png" alt="The panel open below the widget, with every limit per account" width="592">
+</p>
+
 If you switch between logins with `CLAUDE_CONFIG_DIR` or `CODEX_HOME` (a work account and a
 personal one, say), this shows all of them side by side. It reads the logins the CLIs already have,
 so there's nothing to sign in to.
@@ -136,6 +141,10 @@ height of the numbers beside it. When an account's usage changes, its mascot pla
 animation (two that change together never play the same one), and about every ten minutes one
 mascot plays one just because. Click the big mascot in the panel to see one.
 
+<p align="center">
+  <img src="docs/animations.gif" alt="All 35 mascot animations playing in a grid" width="696">
+</p>
+
 Play one yourself, even with animations off:
 
 ```sh
@@ -204,22 +213,29 @@ which may break the widget until it's updated.
 python3 -m unittest discover -s tests       # the backend: parsing, refresh, renewal, config
 node --test tests/test_js.mjs               # the widget's display logic and all 35 animations
 python3 tests/check_claude_renewal.py       # disposable OAuth fixture + the real installed Claude CLI
-ai-usage show --sample                      # made-up accounts, for screenshots
+ai-usage show --sample                      # made-up accounts, as text
+scripts/render-docs                         # the images in docs/, from made-up accounts
 AI_USAGE_CONFIG=/tmp/test.json AI_USAGE_STATE_DIR=/tmp/ai-usage ai-usage refresh
 ```
 
 The renewal check sends all of the CLI's traffic to a local fixture server, so no real token is
-used and nothing reaches Anthropic. `omarchy plugin validate .` checks the manifest.
+used and nothing reaches Anthropic. `scripts/render-docs` draws the widget's own QML offscreen
+with `ai-usage sample`, a stock theme (tokyo-night, or the one you name) and a throwaway home
+folder, so no real account, login or setting ends up in the images; it needs ImageMagick.
+`omarchy plugin validate .` checks the manifest.
 
 | File | Purpose |
 | --- | --- |
 | `bin/ai-usage` | Accounts, Claude and Codex requests, fallbacks, back-off, renewal, the status file, the CLI |
-| `Panel.qml` | The bar widget and its panel |
+| `Panel.qml` | The widget's behaviour: refreshing, timers, animations, IPC |
+| `UsageView.qml` | What the bar and the panel show, and how it reads |
+| `UsageBar.qml`, `UsageContent.qml` | The bar's content and the panel's content |
 | `Mascot.qml`, `Mascot.js` | The pixel-art mascot and its 35 animations |
-| `CodexIcon.qml` | The Codex knot as a vector |
+| `ProviderIcon.qml`, `CodexIcon.qml`, `FigureMetrics.qml` | Provider marks, sized and aligned to the text's figures |
 | `Model.js` | Display helpers: thresholds, countdowns, bar segments |
 | `manifest.json` | The Omarchy plugin manifest and settings |
 | `install.sh` | Links the plugin and CLI and adds the widget to the bar |
+| `scripts/render-docs`, `scripts/render/shell.qml` | Render the README images offscreen |
 
 ## Credits
 

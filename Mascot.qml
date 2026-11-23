@@ -1,4 +1,5 @@
 import QtQuick
+import QtQuick.Shapes
 import "Mascot.js" as Clawd
 
 // The Claude Code mascot as crisp pixel art, `figureHeight` screen pixels tall and as wide as
@@ -40,6 +41,20 @@ Item {
   implicitWidth: figureWidth
   implicitHeight: figureHeight
 
+  // An SVG path of every cell of one kind, each a whole-pixel rectangle.
+  function cellPath(kind) {
+    var parts = []
+    for (var index = 0; index < grid.length; index++) {
+      if (grid[index] !== kind) continue
+      var column = index % Clawd.COLUMNS
+      var row = Math.floor(index / Clawd.COLUMNS)
+      var x = columnEdges[column], y = rowEdges[row]
+      var w = columnEdges[column + 1] - x, h = rowEdges[row + 1] - y
+      if (w > 0 && h > 0) parts.push("M" + x + " " + y + "h" + w + "v" + h + "h" + (-w) + "z")
+    }
+    return parts.join("")
+  }
+
   Item {
     id: figure
     width: root.figureWidth
@@ -63,21 +78,26 @@ Item {
       }
     ]
 
-    Repeater {
-      model: Clawd.COLUMNS * Clawd.ROWS
+    // One path per color, as on macOS, so adjacent pixels fill without seams however the
+    // figure is turned or scaled. Unsmoothed, so the pixel art stays crisp at rest.
+    Shape {
+      anchors.fill: parent
+      preferredRendererType: Shape.GeometryRenderer
 
-      Rectangle {
-        required property int index
-        readonly property int cell: root.grid[index]
-        readonly property int column: index % Clawd.COLUMNS
-        readonly property int row: Math.floor(index / Clawd.COLUMNS)
-        x: root.columnEdges[column]
-        y: root.rowEdges[row]
-        width: root.columnEdges[column + 1] - x
-        height: root.rowEdges[row + 1] - y
-        antialiasing: false
-        visible: cell === Clawd.BODY || (cell === Clawd.EYE && root.fillEyes)
-        color: cell === Clawd.EYE ? root.eyeColor : root.bodyColor
+      ShapePath {
+        fillColor: root.bodyColor
+        strokeWidth: -1
+        strokeColor: "transparent"
+        fillRule: ShapePath.WindingFill
+        PathSvg { path: root.cellPath(Clawd.BODY) }
+      }
+
+      ShapePath {
+        fillColor: root.fillEyes ? root.eyeColor : "transparent"
+        strokeWidth: -1
+        strokeColor: "transparent"
+        fillRule: ShapePath.WindingFill
+        PathSvg { path: root.fillEyes ? root.cellPath(Clawd.EYE) : "" }
       }
     }
   }
