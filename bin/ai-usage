@@ -1,0 +1,1447 @@
+#!/usr/bin/env python3
+"""ai-usage: Claude Code and Codex subscription usage for several accounts at once.
+
+The backend of the ward.ai-usage Omarchy bar widget, and a small CLI of its own. It reads the
+logins the Claude Code and Codex CLIs already keep, asks the same usage endpoints their `/usage`
+and `/status` commands use, and writes the result to a status file the widget watches.
+
+    ai-usage refresh [--force] [--no-renew] [--print]   fetch usage and update the status file
+    ai-usage status                                     print the status file as JSON
+    ai-usage show                                       print usage as text
+    ai-usage accounts                                   list the configured accounts
+    ai-usage add claude|codex DIR [--name N] [--group G] [--usage-type session|week]
+    ai-usage remove ACCOUNT                             ACCOUNT is a number from `accounts` or a name
+    ai-usage usage-type ACCOUNT session|week            what a Claude account shows in the bar
+    ai-usage sample                                     print made-up status JSON
+    ai-usage paths                                      print the config and status file paths
+
+Only the standard library is used. Tokens stay in memory: the status file holds usage, account
+names, and login identities, never credentials.
+"""
+
+import argparse
+import base64
+import calendar
+import concurrent.futures
+import datetime
+import errno
+import fcntl
+import http.client
+import json
+import math
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+
+STATUS_VERSION = 1
+REFRESH_DEDUPE_SECONDS = 60
+LOCK_TIMEOUT_SECONDS = 300
+HTTP_TIMEOUT_SECONDS = 30
+MAX_RESPONSE_BYTES = 2 * 1024 * 1024
+RENEWAL_LEAD_SECONDS = 4 * 60
+RENEWAL_TIMEOUT_SECONDS = 30
+
+SESSION_SECONDS = 5 * 3600
+WEEK_SECONDS = 7 * 86400
+MONTH_SECONDS = 30 * 86400
+
+CLAUDE_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
+
+PROVIDERS = ("claude", "codex")
+USAGE_TYPES = ("session", "week")
+
+
+# MARK: - Paths
+
+
+def expand_tilde(path):
+    """`~` expanded and trailing slashes dropped, like the macOS app's `expandTilde`."""
+    expanded = os.path.expanduser(str(path))
+    while len(expanded) > 1 and expanded.endswith("/"):
+        expanded = expanded[:-1]
+    return expanded
+
+
+def tilde(path):
+    """The path with the home directory shortened to `~`, for messages."""
+    home = os.path.expanduser("~")
+    if path == home:
+        return "~"
+    if path.startswith(home + "/"):
+        return "~" + path[len(home):]
+    return path
+
+
+def config_path():
+    override = os.environ.get("AI_USAGE_CONFIG")
+    if override:
+        return os.path.abspath(expand_tilde(override))
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return os.path.join(base, "ai-usage", "accounts.json")
+
+
+def state_dir():
+    override = os.environ.get("AI_USAGE_STATE_DIR")
+    if override:
+        return os.path.abspath(expand_tilde(override))
+    base = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
+    return os.path.join(base, "ai-usage")
+
+
+def status_path():
+    return os.path.join(state_dir(), "status.json")
+
+
+def default_claude_dir():
+    return expand_tilde("~/.claude")
+
+
+# MARK: - Small helpers
+
+
+class FetchError(Exception):
+    """A failure whose message is safe to show: never a token or a response body."""
+
+    def __init__(self, description, retry_after=None):
+        super().__init__(description)
+        self.description = description
+        self.retry_after = retry_after
+
+    def __str__(self):
+        return self.description
+
+
+def round_half_up(value):
+    return int(math.floor(value + 0.5))
+
+
+def capitalized(text):
+    """Swift's `capitalized`: each space-separated word upper-cased first, the rest lower."""
+    return " ".join(word[:1].upper() + word[1:].lower() for word in str(text).split(" "))
+
+
+def as_number(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if not math.isfinite(value):
+        return None
+    return float(value)
+
+
+def as_int(value):
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and math.isfinite(value) and value.is_integer():
+        return int(value)
+    return None
+
+
+def as_text(value):
+    return value if isinstance(value, str) and value != "" else None
+
+
+def parse_iso(text):
+    """ISO 8601 with or without fractional seconds, to epoch seconds."""
+    if not isinstance(text, str):
+        return None
+    trimmed = re.sub(r"\.\d+", "", text.strip())
+    if trimmed.endswith("Z") or trimmed.endswith("z"):
+        trimmed = trimmed[:-1] + "+00:00"
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2}", trimmed):
+        return None
+    try:
+        return datetime.datetime.fromisoformat(trimmed).timestamp()
+    except ValueError:
+        return None
+
+
+def start_of_next_month(now=None):
+    moment = datetime.datetime.fromtimestamp(time.time() if now is None else now)
+    year, month = (moment.year + 1, 1) if moment.month == 12 else (moment.year, moment.month + 1)
+    return datetime.datetime(year, month, 1).timestamp()
+
+
+def jwt_claims(token):
+    """The payload of a JWT, unverified. Only read for non-secret claims like email and expiry."""
+    parts = str(token).split(".")
+    if len(parts) < 2:
+        return None
+    payload = parts[1].replace("-", "+").replace("_", "/")
+    payload += "=" * ((4 - len(payload) % 4) % 4)
+    try:
+        claims = json.loads(base64.b64decode(payload))
+    except (ValueError, UnicodeDecodeError):
+        return None
+    return claims if isinstance(claims, dict) else None
+
+
+def read_json(path):
+    try:
+        with open(path, "rb") as handle:
+            return json.loads(handle.read())
+    except (OSError, ValueError, UnicodeDecodeError):
+        return None
+
+
+def write_atomic(path, text, mode, directory_mode=0o755):
+    """Replaces `path` in one step, so a reader never sees a half-written file."""
+    directory = os.path.dirname(path)
+    os.makedirs(directory, mode=directory_mode, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=".tmp-", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        os.chmod(temporary, mode)
+        os.replace(temporary, path)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+
+
+def write_private(path, text):
+    """Writes atomically with owner-only permissions."""
+    write_atomic(path, text, 0o600, 0o700)
+
+
+def money(minor, exponent, currency):
+    amount = minor / (10 ** exponent)
+    symbols = {"USD": "$", "EUR": "€", "GBP": "£", "JPY": "¥", "CNY": "¥", "INR": "₹", "KRW": "₩"}
+    digits = max(0, int(exponent))
+    number = f"{amount:,.{digits}f}"
+    symbol = symbols.get(str(currency).upper())
+    return f"{symbol}{number}" if symbol else f"{str(currency).upper()} {number}"
+
+
+# MARK: - Accounts
+
+
+class Account:
+    def __init__(self, name, provider, dir, group=None, short=None, keychain_service=None, usage_type=None):
+        self.name = name
+        self.provider = provider
+        self.dir = dir
+        self.group = group
+        self.short = short
+        self.keychain_service = keychain_service
+        self.usage_type = usage_type
+
+    @property
+    def id(self):
+        return self.name + "|" + self.dir
+
+    @property
+    def expanded_dir(self):
+        return expand_tilde(self.dir)
+
+    @property
+    def claude_usage_type(self):
+        return self.usage_type or "session"
+
+    def to_status(self):
+        entry = {"id": self.id, "name": self.name, "group": self.group, "provider": self.provider, "dir": self.dir}
+        if self.provider == "claude":
+            entry["usageType"] = self.claude_usage_type
+        return entry
+
+
+class ConfigError(Exception):
+    pass
+
+
+def parse_accounts(data):
+    """Validates accounts.json content. A bad entry fails the file, as the macOS app does."""
+    if not isinstance(data, list):
+        raise ConfigError("The file must contain a list of accounts.")
+    accounts, ids = [], set()
+    for index, row in enumerate(data):
+        where = f"Account {index + 1}"
+        if not isinstance(row, dict):
+            raise ConfigError(f"{where} must be an object.")
+        name, provider, dir = row.get("name"), row.get("provider"), row.get("dir")
+        if not isinstance(name, str) or not name.strip():
+            raise ConfigError(f"{where} needs a name.")
+        if provider not in PROVIDERS:
+            raise ConfigError(f"{where} needs a provider: claude or codex.")
+        if not isinstance(dir, str) or not dir.strip():
+            raise ConfigError(f"{where} needs a dir.")
+        for key in ("group", "short", "keychainService", "usageType"):
+            if row.get(key) is not None and not isinstance(row.get(key), str):
+                raise ConfigError(f"{where}: {key} must be text.")
+        usage = row.get("usageType")
+        # A hand-edited value that isn't recognised falls back to Session instead of failing the
+        # whole file over one display preference.
+        usage = usage.lower() if isinstance(usage, str) and usage.lower() in USAGE_TYPES else None
+        if isinstance(row.get("usageType"), str) and usage is None:
+            usage = "session"
+        group = row.get("group") if isinstance(row.get("group"), str) else None
+        account = Account(name, provider, dir, group=group,
+                          short=row.get("short") if isinstance(row.get("short"), str) else None,
+                          keychain_service=as_text(row.get("keychainService")), usage_type=usage)
+        if account.id in ids:
+            raise ConfigError(f"Duplicate account: {name}. Each name and directory pair must be unique.")
+        ids.add(account.id)
+        accounts.append(account)
+    return accounts
+
+
+def discovered_defaults(exists=None):
+    exists = exists or (lambda path: os.path.isdir(expand_tilde(path)))
+    candidates = [Account("Claude", "claude", "~/.claude"), Account("Codex", "codex", "~/.codex")]
+    return [account for account in candidates if exists(account.dir)]
+
+
+def account_row(account):
+    row = {"name": account.name, "provider": account.provider, "dir": account.dir}
+    if account.group:
+        row["group"] = account.group
+    if account.usage_type:
+        row["usageType"] = account.usage_type
+    return row
+
+
+def dump_config(rows):
+    return json.dumps(rows, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
+
+
+def load_accounts(path=None):
+    """The account list, writing discovered defaults on first run."""
+    path = path or config_path()
+    if not os.path.exists(path):
+        defaults = discovered_defaults()
+        write_atomic(path, dump_config([account_row(account) for account in defaults]), 0o644)
+        if not defaults:
+            # JSON has no comments; keep the hint in an adjacent file.
+            write_atomic(path + ".example", dump_config([
+                    {"name": "Claude", "group": "Work", "provider": "claude", "dir": "~/.claude-work"},
+                    {"name": "Codex", "group": "Work", "provider": "codex", "dir": "~/.codex-work"},
+                    {"name": "Claude", "group": "Personal", "provider": "claude", "dir": "~/.claude"},
+                ]), 0o644)
+        return defaults
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError) as error:
+        reason = error.strerror if isinstance(error, OSError) and error.strerror else str(error)
+        raise ConfigError(reason)
+    return parse_accounts(data)
+
+
+def load_rows(path):
+    with open(path, "r", encoding="utf-8") as handle:
+        rows = json.load(handle)
+    parse_accounts(rows)
+    return rows
+
+
+def save_rows(path, rows):
+    for row in rows:
+        if not str(row.get("name", "")).strip() or not str(row.get("dir", "")).strip():
+            raise ConfigError("Each account needs a name and directory.")
+    parse_accounts(rows)
+    write_atomic(path, dump_config(rows), 0o644)
+
+
+# MARK: - Usage model
+
+
+def window(label, used, resets_at=None, detail=None, estimate=False, period=None, kind=None):
+    return {"label": label, "usedPercent": used, "resetsAt": resets_at, "detail": detail,
+            "resetIsEstimate": estimate, "period": period, "kind": kind}
+
+
+def snapshot(windows, identity=None, plan=None, fetched_at=None, stale_reason=None):
+    return {"windows": windows, "identity": identity, "plan": plan,
+            "fetchedAt": time.time() if fetched_at is None else fetched_at, "staleReason": stale_reason}
+
+
+def display_percent(value):
+    return max(0.0, min(100.0, float(value)))
+
+
+def shortest_window(windows):
+    """The window with the shortest period, first listed on a tie; unknown periods come last."""
+    best, best_key = None, None
+    for index, item in enumerate(windows):
+        period = item.get("period")
+        key = (period if isinstance(period, (int, float)) else math.inf, index)
+        if best_key is None or key < best_key:
+            best, best_key = item, key
+    return best
+
+
+def headline_window(snap, account):
+    """Claude's chosen allowance, by kind, never another limit standing in for a missing one."""
+    if not snap:
+        return None
+    windows = snap.get("windows") or []
+    if account.provider != "claude":
+        return shortest_window(windows)
+
+    def first(kind):
+        return next((item for item in windows if item.get("kind") == kind), None)
+
+    if account.claude_usage_type == "week":
+        return first("week")
+    # Plans that only report a monthly spend cap (e.g. Enterprise) headline that cap.
+    return first("session") or first("spend")
+
+
+def menu_text(snap, account):
+    item = headline_window(snap, account)
+    if item is None:
+        return "–"
+    return f"{round_half_up(display_percent(item['usedPercent']))}%"
+
+
+# MARK: - Claude
+
+
+def claude_period(kind):
+    return {"session": SESSION_SECONDS, "weekly_all": WEEK_SECONDS, "weekly_scoped": WEEK_SECONDS}.get(kind)
+
+
+def claude_kind(kind):
+    return {"session": "session", "weekly_all": "week", "weekly_scoped": "scopedWeek"}.get(kind)
+
+
+def claude_label(limit):
+    kind = limit.get("kind")
+    if kind == "session":
+        base = "Session"
+    elif kind in ("weekly_all", "weekly_scoped"):
+        base = "Week"
+    else:
+        base = capitalized(str(as_text(limit.get("group")) or as_text(kind) or "Limit").replace("_", " "))
+    scope = limit.get("scope") if isinstance(limit.get("scope"), dict) else {}
+    model = scope.get("model") if isinstance(scope.get("model"), dict) else {}
+    name = as_text(model.get("display_name"))
+    return f"{base} · {name}" if name else base
+
+
+def claude_windows(usage, now=None):
+    """Windows from the OAuth usage response (or Claude Code's cached copy of it)."""
+    if not isinstance(usage, dict):
+        return []
+    result = []
+    limits = usage.get("limits")
+    if isinstance(limits, list) and limits:
+        for limit in limits:
+            if not isinstance(limit, dict):
+                continue
+            percent = as_number(limit.get("percent"))
+            if percent is None:
+                continue
+            result.append(window(claude_label(limit), percent, parse_iso(limit.get("resets_at")),
+                                 period=claude_period(limit.get("kind")), kind=claude_kind(limit.get("kind"))))
+    else:
+        legacy = [("Session", SESSION_SECONDS, "session", "five_hour"), ("Week", WEEK_SECONDS, "week", "seven_day"),
+                  ("Week · Opus", WEEK_SECONDS, "scopedWeek", "seven_day_opus"),
+                  ("Week · Sonnet", WEEK_SECONDS, "scopedWeek", "seven_day_sonnet")]
+        for label, period, kind, key in legacy:
+            item = usage.get(key)
+            used = as_number(item.get("utilization")) if isinstance(item, dict) else None
+            if used is None:
+                continue
+            result.append(window(label, used, parse_iso(item.get("resets_at")), period=period, kind=kind))
+
+    # A spend cap, e.g. the Enterprise monthly limit. The API gives no reset date, so assume the 1st.
+    spend = usage.get("spend") if isinstance(usage.get("spend"), dict) else {}
+    extra = usage.get("extra_usage") if isinstance(usage.get("extra_usage"), dict) else {}
+    spend_limit = spend.get("limit") if isinstance(spend.get("limit"), dict) else {}
+    spend_used = spend.get("used") if isinstance(spend.get("used"), dict) else {}
+    limit_minor = as_number(spend_limit.get("amount_minor"))
+    if spend.get("enabled") is True and limit_minor is not None and limit_minor > 0:
+        used = as_number(spend_used.get("amount_minor")) or 0
+        exponent = as_int(spend_limit.get("exponent"))
+        exponent = exponent if exponent is not None else 2
+        currency = as_text(spend_limit.get("currency")) or as_text(spend_used.get("currency")) or "USD"
+        result.append(window("Monthly spend", used / limit_minor * 100, start_of_next_month(now),
+                             detail=f"{money(used, exponent, currency)} of {money(limit_minor, exponent, currency)}",
+                             estimate=True, period=MONTH_SECONDS, kind="spend"))
+    else:
+        monthly = as_number(extra.get("monthly_limit"))
+        if extra.get("is_enabled") is True and monthly is not None and monthly > 0:
+            used = as_number(extra.get("used_credits")) or 0
+            currency = as_text(extra.get("currency")) or "USD"
+            utilization = as_number(extra.get("utilization"))
+            result.append(window("Monthly spend", utilization if utilization is not None else used / monthly * 100,
+                                 start_of_next_month(now),
+                                 detail=f"{money(used, 2, currency)} of {money(monthly, 2, currency)}",
+                                 estimate=True, period=MONTH_SECONDS, kind="spend"))
+    return result
+
+
+def claude_plan_name(organization_type):
+    if organization_type is None:
+        return None
+    names = {"claude_max": "Max", "claude_pro": "Pro", "claude_team": "Team", "claude_enterprise": "Enterprise"}
+    return names.get(organization_type) or capitalized(str(organization_type).replace("claude_", ""))
+
+
+class ClaudeCredentials:
+    """Secrets stay in memory; only expiry dates feed the renewal schedule."""
+
+    def __init__(self, access_token, expires_at=None, subscription_type=None, has_refresh_token=False,
+                 refresh_token_expires_at=None):
+        self.access_token = access_token
+        self.expires_at = expires_at
+        self.subscription_type = subscription_type
+        self.has_refresh_token = has_refresh_token
+        self.refresh_token_expires_at = refresh_token_expires_at
+
+    @staticmethod
+    def parse(data):
+        oauth = data.get("claudeAiOauth") if isinstance(data, dict) else None
+        if not isinstance(oauth, dict):
+            return None
+        token = as_text(oauth.get("accessToken"))
+        if not token:
+            return None
+
+        def date(key):
+            value = as_number(oauth.get(key))
+            return value / 1000 if value is not None and value > 0 else None
+
+        return ClaudeCredentials(token, date("expiresAt"), as_text(oauth.get("subscriptionType")),
+                                 bool(as_text(oauth.get("refreshToken"))), date("refreshTokenExpiresAt"))
+
+
+class ClaudeProvider:
+    """Reads Claude Code's own OAuth login and asks the endpoint `/usage` uses. Read-only:
+    credential writes and renewal belong to Claude Code (see `check_renewal`)."""
+
+    def __init__(self, account):
+        self.account = account
+
+    @property
+    def credentials_file(self):
+        return os.path.join(self.account.expanded_dir, ".credentials.json")
+
+    @property
+    def state_files(self):
+        """`~/.claude.json` for the default login; an explicit `CLAUDE_CONFIG_DIR=~/.claude` uses
+        `~/.claude/.claude.json` instead, so both are candidates there and the newest wins."""
+        directory = self.account.expanded_dir
+        inside = os.path.join(directory, ".claude.json")
+        if directory == default_claude_dir():
+            return [expand_tilde("~/.claude.json"), inside]
+        return [inside]
+
+    def read_credentials(self):
+        data = read_json(self.credentials_file)
+        credentials = ClaudeCredentials.parse(data) if data is not None else None
+        if credentials is None:
+            raise FetchError(f"No Claude Code login found in {tilde(self.credentials_file)}")
+        return credentials
+
+    def read_state(self):
+        def modified(path):
+            try:
+                return os.path.getmtime(path)
+            except OSError:
+                return -math.inf
+
+        path = max(self.state_files, key=modified)
+        data = read_json(path)
+        state = {"identity": None, "plan": None, "usage": None, "cachedAt": None}
+        if not isinstance(data, dict):
+            return state
+        oauth = data.get("oauthAccount")
+        if isinstance(oauth, dict):
+            state["identity"] = as_text(oauth.get("emailAddress"))
+            state["plan"] = claude_plan_name(as_text(oauth.get("organizationType")))
+        cache = data.get("cachedUsageUtilization")
+        if isinstance(cache, dict) and isinstance(cache.get("utilization"), dict):
+            state["usage"] = cache["utilization"]
+            fetched = as_number(cache.get("fetchedAtMs"))
+            state["cachedAt"] = fetched / 1000 if fetched is not None else None
+        return state
+
+    def cached(self, state, reason):
+        """Claude Code's own cached copy of the usage response, when the live request can't run."""
+        if state["usage"] is None or state["cachedAt"] is None:
+            raise FetchError(reason)
+        return snapshot(claude_windows(state["usage"]), state["identity"], state["plan"], state["cachedAt"], reason)
+
+    def fetch(self, now=None):
+        now = time.time() if now is None else now
+        state = self.read_state()
+        try:
+            credentials = self.read_credentials()
+        except FetchError as error:
+            return self.cached(state, error.description)
+        if credentials.expires_at is not None and credentials.expires_at < now:
+            return self.cached(state, "Token expired. Open Claude Code to refresh it.")
+
+        status, body, headers = http_get(CLAUDE_USAGE_URL, {
+            "Authorization": f"Bearer {credentials.access_token}",
+            "anthropic-beta": "oauth-2025-04-20",
+            "User-Agent": "claude-code/2.1.0",
+            "Accept": "application/json",
+        }, "Anthropic")
+        if status == 200:
+            usage = parse_body(body, "Anthropic")
+            plan = state["plan"] or (capitalized(credentials.subscription_type) if credentials.subscription_type else None)
+            return snapshot(claude_windows(usage), state["identity"], plan)
+        if status == 401:
+            return self.cached(state, "Token rejected. Open Claude Code to refresh it.")
+        if status == 429:
+            raise FetchError("Rate limited by Anthropic", retry_after_from(headers))
+        raise FetchError(f"Anthropic returned HTTP {status}")
+
+
+# MARK: - Codex
+
+
+def codex_label(seconds):
+    seconds = int(seconds or 0)
+    if seconds == 18000:
+        return "5-hour"
+    if seconds == 604800:
+        return "Week"
+    if seconds > 0 and seconds % 86400 == 0:
+        return f"{seconds // 86400}-day"
+    if seconds > 0 and seconds % 3600 == 0:
+        return f"{seconds // 3600}-hour"
+    if seconds > 0 and seconds % 60 == 0:
+        return f"{seconds // 60}-minute"
+    if seconds > 0:
+        return f"{seconds}-second"
+    return "Limit"
+
+
+def codex_plan_name(raw):
+    if raw is None:
+        return None
+    return "Pro Lite" if raw == "prolite" else capitalized(raw)
+
+
+def codex_rate_windows(limit, prefix=None):
+    if not isinstance(limit, dict):
+        return []
+    result = []
+    for key in ("primary_window", "secondary_window"):
+        item = limit.get(key)
+        if not isinstance(item, dict):
+            continue
+        used = as_number(item.get("used_percent"))
+        if used is None:
+            continue
+        seconds = as_int(item.get("limit_window_seconds"))
+        label = codex_label(seconds or 0)
+        reset = as_number(item.get("reset_at"))
+        result.append(window(f"{label} · {prefix}" if prefix else label, used, reset,
+                             period=float(seconds) if seconds is not None else None))
+    return result
+
+
+def codex_windows(usage):
+    if not isinstance(usage, dict):
+        return []
+    result = codex_rate_windows(usage.get("rate_limit"))
+    for extra in usage.get("additional_rate_limits") or []:
+        if isinstance(extra, dict):
+            result += codex_rate_windows(extra.get("rate_limit"), as_text(extra.get("limit_name")))
+    return result
+
+
+class CodexProvider:
+    """Reads the Codex CLI's ChatGPT login from `$CODEX_HOME/auth.json` (read-only) and asks the
+    endpoint behind `/status`. It never refreshes the token; the Codex CLI does that itself."""
+
+    def __init__(self, account):
+        self.account = account
+
+    def read_auth(self):
+        data = read_json(os.path.join(self.account.expanded_dir, "auth.json"))
+        tokens = data.get("tokens") if isinstance(data, dict) else None
+        access = as_text(tokens.get("access_token")) if isinstance(tokens, dict) else None
+        if not access:
+            raise FetchError(f"No ChatGPT login in {self.account.dir}/auth.json")
+        auth = {"accessToken": access, "accountId": as_text(tokens.get("account_id")),
+                "email": None, "plan": None, "expiresAt": None}
+        claims = jwt_claims(access)
+        if claims and as_number(claims.get("exp")) is not None:
+            auth["expiresAt"] = float(claims["exp"])
+        id_claims = jwt_claims(tokens.get("id_token")) if as_text(tokens.get("id_token")) else None
+        if id_claims:
+            auth["email"] = as_text(id_claims.get("email"))
+            openai = id_claims.get("https://api.openai.com/auth")
+            openai = openai if isinstance(openai, dict) else {}
+            auth["plan"] = as_text(openai.get("chatgpt_plan_type"))
+            auth["accountId"] = auth["accountId"] or as_text(openai.get("chatgpt_account_id"))
+        return auth
+
+    def fetch(self, now=None):
+        now = time.time() if now is None else now
+        try:
+            auth = self.read_auth()
+        except FetchError as error:
+            return self.session_log_snapshot(error.description)
+        if auth["expiresAt"] is not None and auth["expiresAt"] < now:
+            return self.session_log_snapshot("Token expired. Run Codex to refresh it.", auth)
+
+        headers = {"Authorization": f"Bearer {auth['accessToken']}", "User-Agent": "ai-usage",
+                   "Accept": "application/json"}
+        if auth["accountId"]:
+            headers["ChatGPT-Account-Id"] = auth["accountId"]
+        status, body, response_headers = http_get(CODEX_USAGE_URL, headers, "ChatGPT")
+        if status == 200:
+            usage = parse_body(body, "ChatGPT")
+            return snapshot(codex_windows(usage), auth["email"], codex_plan_name(usage.get("plan_type") or auth["plan"]))
+        if status in (401, 403):
+            return self.session_log_snapshot("Token rejected. Run Codex to refresh it.", auth)
+        if status == 429:
+            raise FetchError("Rate limited by ChatGPT", retry_after_from(response_headers))
+        raise FetchError(f"ChatGPT returned HTTP {status}")
+
+    def newest_session_files(self, limit):
+        root = os.path.realpath(os.path.join(self.account.expanded_dir, "sessions"))
+        files = []
+        for directory, _, names in os.walk(root):
+            for name in names:
+                if not name.endswith(".jsonl"):
+                    continue
+                path = os.path.join(directory, name)
+                try:
+                    files.append((path, os.path.getmtime(path)))
+                except OSError:
+                    continue
+        files.sort(key=lambda item: item[1], reverse=True)
+        return files[:limit]
+
+    def session_log_snapshot(self, reason, auth=None):
+        """Codex writes a `rate_limits` snapshot into its session logs after each turn. The newest
+        log may be a session that hasn't finished a turn yet, so look at a few."""
+        for path, modified in self.newest_session_files(5):
+            try:
+                with open(path, "r", encoding="utf-8", errors="replace") as handle:
+                    lines = handle.read().split("\n")
+            except OSError:
+                continue
+            for line in reversed(lines):
+                if '"rate_limits"' not in line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except ValueError:
+                    continue
+                payload = entry.get("payload") if isinstance(entry, dict) else None
+                limits = payload.get("rate_limits") if isinstance(payload, dict) else None
+                if not isinstance(limits, dict):
+                    continue
+                windows = []
+                for key in ("primary", "secondary"):
+                    item = limits.get(key)
+                    used = as_number(item.get("used_percent")) if isinstance(item, dict) else None
+                    if used is None:
+                        continue
+                    minutes = as_int(item.get("window_minutes"))
+                    windows.append(window(codex_label((minutes or 0) * 60), used, as_number(item.get("resets_at")),
+                                          period=float(minutes * 60) if minutes is not None else None))
+                plan = as_text(limits.get("plan_type")) or (auth or {}).get("plan")
+                fetched = parse_iso(entry.get("timestamp"))
+                return snapshot(windows, (auth or {}).get("email"), codex_plan_name(plan),
+                                fetched if fetched is not None else modified, reason)
+        raise FetchError(reason)
+
+
+# MARK: - HTTP
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    """A redirect would carry the bearer token to wherever it points; treat it as an error."""
+
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+OPENER = urllib.request.build_opener(NoRedirect)
+
+
+def http_get(url, headers, service):
+    """(status, body, headers). Raises FetchError when the service can't be reached."""
+    request = urllib.request.Request(url, headers=headers, method="GET")
+    try:
+        with OPENER.open(request, timeout=HTTP_TIMEOUT_SECONDS) as response:
+            return response.status, response.read(MAX_RESPONSE_BYTES + 1), response.headers
+    except urllib.error.HTTPError as error:
+        return error.code, b"", error.headers
+    except (urllib.error.URLError, http.client.HTTPException, OSError, ValueError):
+        raise FetchError(f"Could not reach {service}")
+
+
+def parse_body(body, service):
+    if len(body) > MAX_RESPONSE_BYTES:
+        raise FetchError(f"{service} returned an unexpectedly large response")
+    try:
+        data = json.loads(body)
+    except (ValueError, UnicodeDecodeError):
+        raise FetchError(f"{service} returned an unexpected response")
+    if not isinstance(data, dict):
+        raise FetchError(f"{service} returned an unexpected response")
+    return data
+
+
+def retry_after_from(headers, now=None):
+    now = time.time() if now is None else now
+    value = headers.get("Retry-After") if headers is not None else None
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return now + 10 * 60
+    if not math.isfinite(seconds):
+        return now + 10 * 60
+    return now + max(60.0, seconds)
+
+
+def fetch_snapshot(account):
+    provider = ClaudeProvider(account) if account.provider == "claude" else CodexProvider(account)
+    return provider.fetch()
+
+
+# MARK: - Claude renewal
+
+
+def renewal_environment(account, inherited):
+    """Claude Code's environment for one login: the login's own config dir, nothing inherited
+    that could point it elsewhere, and everything nonessential off."""
+    environment = {key: value for key, value in inherited.items()
+                   if not key.startswith("ANTHROPIC_") and not key.startswith("CLAUDE_") and key != "CLAUDECODE"}
+    if account.expanded_dir != default_claude_dir():
+        environment["CLAUDE_CONFIG_DIR"] = account.expanded_dir
+    environment.update({
+        "CLAUDE_CODE_SAFE_MODE": "1",
+        "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+        "DISABLE_AUTOUPDATER": "1",
+        "DISABLE_TELEMETRY": "1",
+        "DISABLE_ERROR_REPORTING": "1",
+    })
+    return environment
+
+
+RENEWAL_ARGUMENTS = [
+    "--safe-mode", "--setting-sources", "", "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
+    "--tools", "", "--no-chrome", "--no-session-persistence", "-p", "/usage",
+]
+
+
+def claude_executable(environment):
+    candidates = [expand_tilde("~/.local/bin/claude")]
+    candidates += [os.path.join(entry, "claude") for entry in environment.get("PATH", "").split(":") if entry]
+    candidates += ["/usr/local/bin/claude", "/usr/bin/claude"]
+    for candidate in candidates:
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+def run_claude_usage(account, timeout=RENEWAL_TIMEOUT_SECONDS):
+    """Runs Claude Code's local `/usage` command for one login, which renews an access token
+    that is about to expire. No prompts, tools, hooks, MCP, or saved session; output discarded."""
+    environment = renewal_environment(account, os.environ)
+    executable = claude_executable(environment)
+    if executable is None:
+        raise FetchError("Claude CLI was not found. Install Claude Code to enable automatic renewal.")
+    directory = os.path.join(state_dir(), "claude-renewal")
+    try:
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+        process = subprocess.Popen([executable] + RENEWAL_ARGUMENTS, env=environment, cwd=directory,
+                                   stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                   start_new_session=True)
+    except OSError:
+        raise FetchError("Could not launch Claude CLI for renewal.")
+    try:
+        code = process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        for sig, grace in ((signal.SIGTERM, 2), (signal.SIGKILL, 2)):
+            try:
+                os.killpg(process.pid, sig)
+            except OSError:
+                pass
+            try:
+                process.wait(timeout=grace)
+                break
+            except subprocess.TimeoutExpired:
+                continue
+        raise FetchError("Claude CLI renewal timed out. Retrying automatically.")
+    if code != 0:
+        raise FetchError("Claude CLI renewal failed. Retrying automatically; check your Claude Code login if it persists.")
+
+
+def renewal_scope(account):
+    return account.expanded_dir
+
+
+def check_renewal(account, failures, now=None, read=None, run=None, clock=None):
+    """Renews a Claude login shortly before its access token expires.
+
+    Returns {"nextCheck", "error", "renewed"}. `failures` (scope -> failure) is updated in place
+    and persists between runs. Claude Code performs every credential write; this only asks it to
+    and then checks that the saved token really moved on: exit code zero alone proves nothing."""
+    clock = clock or time.time
+    now = clock() if now is None else now
+    read = read or (lambda target: ClaudeProvider(target).read_credentials())
+    run = run or run_claude_usage
+    result = {"nextCheck": None, "error": None, "renewed": False}
+    if account.provider != "claude":
+        return result
+    key = renewal_scope(account)
+    failure = failures.get(key)
+    try:
+        credentials = read(account)
+    except FetchError:
+        # Missing or unreadable credentials never start a CLI login or browser flow.
+        result["error"] = failure.get("message") if failure else None
+        return result
+    expiry = credentials.expires_at
+    if expiry is None:
+        return result
+    if failure and failure.get("expiry") != expiry:
+        failures.pop(key, None)
+        failure = None
+    if not credentials.has_refresh_token:
+        result["error"] = "Claude login cannot renew automatically. Run claude auth login."
+        return result
+    if credentials.refresh_token_expires_at is not None and credentials.refresh_token_expires_at <= now:
+        result["error"] = "Claude login expired. Run claude auth login."
+        return result
+    deadline = expiry - RENEWAL_LEAD_SECONDS
+    if deadline > now:
+        result["nextCheck"] = deadline
+        return result
+    if failure and failure.get("retryAt", 0) > now:
+        result.update(nextCheck=failure["retryAt"], error=failure.get("message"))
+        return result
+    try:
+        run(account)
+        updated = read(account)
+        later = clock()
+        if (updated.expires_at is None or updated.expires_at <= expiry or updated.expires_at <= later
+                or updated.access_token == credentials.access_token):
+            raise FetchError("Claude renewal did not advance the saved token expiry.")
+        failures.pop(key, None)
+        # A very short server lifetime still gets a bounded retry rather than a busy loop.
+        result.update(nextCheck=max(later + 5, updated.expires_at - RENEWAL_LEAD_SECONDS), renewed=True)
+        return result
+    except Exception as error:  # noqa: BLE001 - every failure is retried, with a safe message only
+        count = min((failure or {}).get("count", 0) + 1, 5)
+        later = clock()
+        retry_at = later + min(300, 30 * 2 ** (count - 1))
+        # Never show subprocess output, credential blobs, or arbitrary error text.
+        message = error.description if isinstance(error, FetchError) else \
+            "Could not verify Claude renewal. Retrying automatically."
+        failures[key] = {"expiry": expiry, "count": count, "retryAt": retry_at, "message": message}
+        result.update(nextCheck=retry_at, error=message)
+        return result
+
+
+# MARK: - Status
+
+KINDS = ("session", "week", "scopedWeek", "spend")
+
+
+class LockTimeout(Exception):
+    pass
+
+
+def empty_status():
+    return {"version": STATUS_VERSION, "configPath": tilde(config_path()), "configError": None,
+            "lastRefresh": None, "lastFetch": None, "nextCheck": None, "accounts": [], "renewal": {}}
+
+
+def clean_window(item):
+    if not isinstance(item, dict) or not isinstance(item.get("label"), str) or as_number(item.get("usedPercent")) is None:
+        return None
+    return window(item["label"], as_number(item["usedPercent"]), as_number(item.get("resetsAt")),
+                  as_text(item.get("detail")), item.get("resetIsEstimate") is True, as_number(item.get("period")),
+                  item.get("kind") if item.get("kind") in KINDS else None)
+
+
+def clean_snapshot(snap):
+    if not isinstance(snap, dict) or as_number(snap.get("fetchedAt")) is None or not isinstance(snap.get("windows"), list):
+        return None
+    windows = [clean_window(item) for item in snap["windows"]]
+    return snapshot([item for item in windows if item], as_text(snap.get("identity")), as_text(snap.get("plan")),
+                    as_number(snap["fetchedAt"]), as_text(snap.get("staleReason")))
+
+
+def clean_entry(entry):
+    """One saved account entry with every field checked; None when it can't be used at all."""
+    if not isinstance(entry, dict) or not isinstance(entry.get("id"), str) or entry.get("provider") not in PROVIDERS:
+        return None
+    clean = {"id": entry["id"], "provider": entry["provider"]}
+    for key in ("name", "dir", "group", "usageType", "menuText", "fetchNote", "renewalError", "error"):
+        clean[key] = as_text(entry.get(key))
+    clean["name"] = clean["name"] or ""
+    clean["menuText"] = clean["menuText"] or "–"
+    clean["snapshot"] = clean_snapshot(entry.get("snapshot"))
+    clean["headline"] = clean_window(entry.get("headline"))
+    clean["fetchFailed"] = entry.get("fetchFailed") is True
+    clean["retryAfter"] = as_number(entry.get("retryAfter"))
+    return clean
+
+
+def clean_failure(value):
+    if not isinstance(value, dict):
+        return None
+    expiry, count, retry_at = as_number(value.get("expiry")), as_int(value.get("count")), as_number(value.get("retryAt"))
+    if expiry is None or count is None or retry_at is None:
+        return None
+    return {"expiry": expiry, "count": max(1, min(count, 5)), "retryAt": retry_at, "message": as_text(value.get("message"))}
+
+
+def load_status():
+    """The saved status, checked field by field: a damaged file loses what is damaged and never
+    stops a refresh."""
+    data = read_json(status_path())
+    status = empty_status()
+    if not isinstance(data, dict) or data.get("version") != STATUS_VERSION:
+        return status
+    for key in ("lastRefresh", "lastFetch", "nextCheck"):
+        status[key] = as_number(data.get(key))
+    status["configError"] = as_text(data.get("configError"))
+    accounts = data.get("accounts") if isinstance(data.get("accounts"), list) else []
+    status["accounts"] = [entry for entry in map(clean_entry, accounts) if entry]
+    renewal = data.get("renewal") if isinstance(data.get("renewal"), dict) else {}
+    status["renewal"] = {key: value for key, value in ((key, clean_failure(item)) for key, item in renewal.items())
+                         if isinstance(key, str) and value}
+    return status
+
+
+def account_states(status):
+    return {entry["id"]: entry for entry in status.get("accounts") or []}
+
+
+def finish_entry(entry, account):
+    """Derives what an entry shows from what was fetched and how its renewal went, as the macOS
+    app does: after a fetch, a cached copy's reason before a renewal problem; after a failure,
+    a renewal problem before the fetch error."""
+    if entry.get("fetchFailed"):
+        entry["error"] = entry.get("renewalError") or entry.get("fetchNote")
+    else:
+        entry["error"] = entry.get("fetchNote") or entry.get("renewalError")
+    entry["headline"] = headline_window(entry.get("snapshot"), account)
+    entry["menuText"] = menu_text(entry.get("snapshot"), account)
+    return entry
+
+
+def build_entries(accounts, states):
+    """Status entries in config order. A state survives only while its account keeps its provider."""
+    entries = []
+    for account in accounts:
+        previous = states.get(account.id) or {}
+        same = previous.get("provider") == account.provider
+        entry = account.to_status()
+        for key, empty in (("snapshot", None), ("fetchNote", None), ("fetchFailed", False),
+                           ("renewalError", None), ("retryAfter", None)):
+            entry[key] = previous.get(key, empty) if same else empty
+        entries.append(finish_entry(entry, account))
+    return entries
+
+
+def save_status(status):
+    write_private(status_path(), json.dumps(status, indent=1) + "\n")
+
+
+class Lock:
+    """Serializes refreshes: the widget runs on every monitor, and one refresh must see the last."""
+
+    def __init__(self, timeout=LOCK_TIMEOUT_SECONDS):
+        self.timeout = timeout
+        self.handle = None
+
+    def __enter__(self):
+        os.makedirs(state_dir(), mode=0o700, exist_ok=True)
+        self.handle = open(os.path.join(state_dir(), ".lock"), "a")
+        deadline = time.monotonic() + self.timeout
+        while True:
+            try:
+                fcntl.flock(self.handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return self
+            except OSError as error:
+                if error.errno not in (errno.EAGAIN, errno.EACCES):
+                    raise
+                if time.monotonic() > deadline:
+                    self.handle.close()
+                    raise LockTimeout("another refresh is still running")
+                time.sleep(0.2)
+
+    def __exit__(self, *_):
+        fcntl.flock(self.handle, fcntl.LOCK_UN)
+        self.handle.close()
+
+
+def refresh(force=False, renew=True, fetch=None, now=None):
+    """One refresh: reread the config, renew Claude logins that are about to expire, fetch the
+    accounts that are due, and save the result. Returns the new status."""
+    fetch = fetch or fetch_snapshot
+    with Lock():
+        status = load_status()
+        now = time.time() if now is None else now
+        status["configPath"] = tilde(config_path())
+        try:
+            accounts = load_accounts()
+        except (ConfigError, OSError) as error:
+            # Keep showing the last accounts, as the macOS app does, with the error above them.
+            status["configError"] = f"Could not read {tilde(config_path())}: {error}"
+            status["lastRefresh"] = now
+            save_status(status)
+            return status
+        status["configError"] = None
+        entries = {entry["id"]: entry for entry in build_entries(accounts, account_states(status))}
+        claude = [account for account in accounts if account.provider == "claude"]
+
+        # Credential upkeep is independent of the usage API's Retry-After back-off. Every check
+        # rereads the login, so a renewal by another CLI session replaces an obsolete deadline.
+        renewal, cleared = {}, set()
+        if renew:
+            scopes = {renewal_scope(account) for account in claude}
+            failures = {key: value for key, value in status["renewal"].items() if key in scopes}
+            for account in claude:
+                renewal[account.id] = check_renewal(account, failures)
+                entry = entries[account.id]
+                if entry.get("renewalError") and not renewal[account.id]["error"]:
+                    cleared.add(account.id)
+                entry["renewalError"] = renewal[account.id]["error"]
+            status["renewal"] = failures
+            checks = [result["nextCheck"] for result in renewal.values() if result["nextCheck"] is not None]
+            status["nextCheck"] = min(checks) if checks else None
+        else:
+            # The schedule and back-off stay for the next refresh that does renew.
+            for account in claude:
+                entries[account.id]["renewalError"] = None
+
+        # Several widgets (one per monitor) may ask at once: a fetch in the last minute is reused
+        # unless forced. A new account, or a login that was just renewed, is fetched regardless.
+        since = now - status["lastFetch"] if status.get("lastFetch") is not None else None
+        recent = not force and since is not None and 0 <= since < REFRESH_DEDUPE_SECONDS
+
+        def is_due(account):
+            entry = entries[account.id]
+            if (entry.get("retryAfter") or 0) > now:
+                return False
+            if not recent:
+                return True
+            never = entry.get("snapshot") is None and entry.get("fetchNote") is None
+            return never or account.id in cleared or (renewal.get(account.id) or {}).get("renewed", False)
+
+        due = [account for account in accounts if is_due(account)]
+        if due:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(due))) as pool:
+                futures = {account.id: pool.submit(fetch, account) for account in due}
+                results = {}
+                for key, future in futures.items():
+                    try:
+                        results[key] = (future.result(), None)
+                    except FetchError as error:
+                        results[key] = (None, error)
+                    except Exception:  # noqa: BLE001 - one broken account must not stop the rest
+                        results[key] = (None, FetchError("Could not read usage"))
+            for account in due:
+                entry = entries[account.id]
+                snap, error = results[account.id]
+                if snap is not None:
+                    # Don't replace fresher live data with an older cached copy.
+                    previous = entry.get("snapshot")
+                    if snap.get("staleReason") is None or (previous or {}).get("fetchedAt", 0) <= snap["fetchedAt"]:
+                        entry["snapshot"] = snap
+                    entry.update(fetchNote=snap.get("staleReason"), fetchFailed=False, retryAfter=None)
+                else:
+                    entry.update(fetchNote=error.description, fetchFailed=True, retryAfter=error.retry_after)
+            if not recent:
+                status["lastFetch"] = now
+
+        status["accounts"] = [finish_entry(entries[account.id], account) for account in accounts]
+        status["lastRefresh"] = now
+        save_status(status)
+        return status
+
+
+def rebuild_status():
+    """Applies a config change to the saved status without fetching, e.g. a usage-type switch."""
+    with Lock():
+        status = load_status()
+        status["configPath"] = tilde(config_path())
+        try:
+            accounts = load_accounts()
+            status["configError"] = None
+            status["accounts"] = build_entries(accounts, account_states(status))
+        except (ConfigError, OSError) as error:
+            status["configError"] = f"Could not read {tilde(config_path())}: {error}"
+        save_status(status)
+        return status
+
+
+# MARK: - Sample data
+
+
+def sample_status(now=None):
+    """Made-up accounts and usage for screenshots and demos. Reads no config or credentials."""
+    now = time.time() if now is None else now
+
+    def hours(value):
+        return now + value * 3600
+
+    def entry(name, group, provider, snap, usage_type=None):
+        account = Account(name, provider, f"~/.{provider}-{group.lower()}", group=group, usage_type=usage_type)
+        result = account.to_status()
+        result.update(snapshot=snap, fetchNote=None, fetchFailed=False, renewalError=None, retryAfter=None)
+        return finish_entry(result, account)
+
+    status = empty_status()
+    status.update(configPath="~/.config/ai-usage/accounts.json", lastRefresh=now, lastFetch=now, sample=True)
+    status["accounts"] = [
+        entry("Claude", "Work", "claude", snapshot(
+            [window("Monthly spend", 82, start_of_next_month(now), "$410.00 of $500.00", True, MONTH_SECONDS, "spend")],
+            "you@company.com", "Enterprise", now)),
+        entry("Codex", "Work", "codex", snapshot(
+            [window("5-hour", 12, hours(3.2), period=18000), window("Week", 38, hours(70), period=604800)],
+            "you@company.com", "Team", now)),
+        entry("Claude", "Personal", "claude", snapshot(
+            [window("Session", 23, hours(2.6), period=SESSION_SECONDS, kind="session"),
+             window("Week", 41, hours(121), period=WEEK_SECONDS, kind="week"),
+             window("Week · Fable", 93, hours(121), period=WEEK_SECONDS, kind="scopedWeek")],
+            "you@example.com", "Max", now)),
+        entry("Codex", "Personal", "codex", snapshot(
+            [window("5-hour", 7, hours(4.1), period=18000), window("Week", 77, hours(150), period=604800)],
+            "you@example.com", "Pro", now)),
+    ]
+    return status
+
+
+# MARK: - Text output
+
+
+def format_reset(item, now):
+    reset = item.get("resetsAt")
+    if reset is None:
+        return ""
+    if item.get("resetIsEstimate"):
+        return "↻ ~" + time.strftime("%-d %b", time.localtime(reset))
+    seconds = max(0, int(reset - now))
+    days, hours, minutes = seconds // 86400, seconds % 86400 // 3600, seconds % 3600 // 60
+    if days:
+        return f"↻ {days}d {hours}h"
+    if hours:
+        return f"↻ {hours}h {minutes}m"
+    return f"↻ {minutes}m"
+
+
+def format_age(seconds):
+    seconds = max(0, int(seconds))
+    if seconds < 60:
+        return "just now"
+    if seconds < 3600:
+        return f"{seconds // 60}m ago"
+    if seconds < 86400:
+        return f"{seconds // 3600}h ago"
+    return f"{seconds // 86400}d ago"
+
+
+def render_text(status, now=None):
+    now = time.time() if now is None else now
+    lines = []
+    updated = status.get("lastRefresh")
+    lines.append("AI Usage" + (" · updated " + time.strftime("%H:%M", time.localtime(updated)) if updated else ""))
+    if status.get("configError"):
+        lines.append(status["configError"])
+    accounts = status.get("accounts") or []
+    if not accounts and not status.get("configError"):
+        lines.append(f"No accounts configured. Add one with `ai-usage add` or edit {status.get('configPath')}.")
+    previous_group = object()
+    for entry in accounts:
+        group = entry.get("group")
+        if group != previous_group and group:
+            lines.append("")
+            lines.append(group.upper())
+        elif group != previous_group or not group:
+            lines.append("")
+        previous_group = group
+        lines.append(f"{entry.get('name')} ({entry.get('provider')})".ljust(44) + str(entry.get("menuText") or "–"))
+        snap = entry.get("snapshot")
+        if snap:
+            meta = " · ".join(part for part in (snap.get("identity"), snap.get("plan")) if part)
+            if meta:
+                lines.append("  " + meta)
+            for item in snap.get("windows") or []:
+                percent = f"{round_half_up(display_percent(item['usedPercent']))}%"
+                filled = round_half_up(display_percent(item["usedPercent"]) / 10)
+                bar = "█" * filled + "░" * (10 - filled)
+                lines.append(f"  {item['label'][:22].ljust(22)} {format_reset(item, now).ljust(12)} {percent.rjust(4)}  {bar}")
+                if item.get("detail"):
+                    lines.append("  " + item["detail"])
+            if not snap.get("windows"):
+                lines.append("  No limits reported")
+            if snap.get("staleReason"):
+                lines.append(f"  Cached data from {format_age(now - snap['fetchedAt'])}")
+        elif not entry.get("error"):
+            lines.append("  Not fetched yet")
+        if entry.get("error"):
+            lines.append("  " + entry["error"])
+    return "\n".join(lines) + "\n"
+
+
+# MARK: - Commands
+
+
+def find_row(rows, key):
+    if re.fullmatch(r"\d+", key):
+        index = int(key) - 1
+        if 0 <= index < len(rows):
+            return index
+        raise SystemExit(f"ai-usage: there is no account {key}; see `ai-usage accounts`.")
+    matches = [index for index, row in enumerate(rows) if row.get("name") == key]
+    if len(matches) == 1:
+        return matches[0]
+    if not matches:
+        raise SystemExit(f"ai-usage: no account named {key!r}; see `ai-usage accounts`.")
+    raise SystemExit(f"ai-usage: several accounts are named {key!r}; use its number from `ai-usage accounts`.")
+
+
+def edit_config(change):
+    path = config_path()
+    try:
+        if not os.path.exists(path):
+            load_accounts(path)
+        rows = load_rows(path)
+        change(rows)
+        save_rows(path, rows)
+    except (ConfigError, ValueError, OSError) as error:
+        raise SystemExit(f"ai-usage: {tilde(path)}: {error}")
+    rebuild_status()
+
+
+def command_accounts(_):
+    try:
+        accounts = load_accounts()
+    except (ConfigError, OSError) as error:
+        raise SystemExit(f"ai-usage: {tilde(config_path())}: {error}")
+    if not accounts:
+        print(f"No accounts in {tilde(config_path())}. Add one with `ai-usage add claude ~/.claude`.")
+    for index, account in enumerate(accounts, 1):
+        extra = f", shows {account.claude_usage_type}" if account.provider == "claude" else ""
+        group = f" [{account.group}]" if account.group else ""
+        print(f"{index}. {account.name}{group}: {account.provider} in {account.dir}{extra}")
+
+
+def command_add(args):
+    def change(rows):
+        row = {"name": args.name or capitalized(args.provider), "provider": args.provider, "dir": args.dir}
+        if args.group:
+            row["group"] = args.group
+        if args.usage_type:
+            if args.provider != "claude":
+                raise ConfigError("--usage-type only applies to Claude accounts.")
+            row["usageType"] = args.usage_type
+        rows.append(row)
+
+    if not os.path.isdir(expand_tilde(args.dir)):
+        print(f"ai-usage: note: {args.dir} does not exist yet; sign in with that directory first.", file=sys.stderr)
+    edit_config(change)
+    command_accounts(args)
+
+
+def command_remove(args):
+    edit_config(lambda rows: rows.pop(find_row(rows, args.account)))
+    command_accounts(args)
+
+
+def command_usage_type(args):
+    def change(rows):
+        row = rows[find_row(rows, args.account)]
+        if row.get("provider") != "claude":
+            raise ConfigError("Only Claude accounts have a usage type.")
+        row["usageType"] = args.type
+
+    edit_config(change)
+
+
+def command_refresh(args):
+    status = refresh(force=args.force, renew=not args.no_renew)
+    if args.print:
+        print(json.dumps(status, indent=1, ensure_ascii=False))
+
+
+def command_status(_):
+    print(json.dumps(load_status(), indent=1, ensure_ascii=False))
+
+
+def command_show(args):
+    status = sample_status() if args.sample else (load_status() if os.path.exists(status_path()) else None)
+    if status is None:
+        status = refresh()
+    sys.stdout.write(render_text(status))
+
+
+def command_sample(_):
+    print(json.dumps(sample_status(), indent=1, ensure_ascii=False))
+
+
+def command_paths(_):
+    print(f"config  {config_path()}")
+    print(f"status  {status_path()}")
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(prog="ai-usage", description="Claude Code and Codex usage for several accounts.")
+    commands = parser.add_subparsers(dest="command", required=True)
+
+    sub = commands.add_parser("refresh", help="fetch usage and update the status file")
+    sub.add_argument("--force", action="store_true", help="fetch even if another refresh just did")
+    sub.add_argument("--no-renew", action="store_true", help="don't renew Claude logins that are about to expire")
+    sub.add_argument("--print", action="store_true", help="print the new status as JSON")
+    sub.set_defaults(handler=command_refresh)
+
+    commands.add_parser("status", help="print the status file as JSON").set_defaults(handler=command_status)
+    sub = commands.add_parser("show", help="print usage as text")
+    sub.add_argument("--sample", action="store_true", help="show made-up accounts")
+    sub.set_defaults(handler=command_show)
+    commands.add_parser("accounts", help="list the configured accounts").set_defaults(handler=command_accounts)
+
+    sub = commands.add_parser("add", help="add an account")
+    sub.add_argument("provider", choices=PROVIDERS)
+    sub.add_argument("dir", help="the login's CLAUDE_CONFIG_DIR or CODEX_HOME, e.g. ~/.claude-work")
+    sub.add_argument("--name", help="shown in the panel (default: Claude or Codex)")
+    sub.add_argument("--group", help="accounts in a group sit together, e.g. Work")
+    sub.add_argument("--usage-type", choices=USAGE_TYPES, help="Claude only: what the bar shows")
+    sub.set_defaults(handler=command_add)
+
+    sub = commands.add_parser("remove", help="remove an account")
+    sub.add_argument("account", help="its number from `ai-usage accounts`, or its name")
+    sub.set_defaults(handler=command_remove)
+
+    sub = commands.add_parser("usage-type", help="what a Claude account shows in the bar")
+    sub.add_argument("account", help="its number from `ai-usage accounts`, or its name")
+    sub.add_argument("type", choices=USAGE_TYPES)
+    sub.set_defaults(handler=command_usage_type)
+
+    commands.add_parser("sample", help="print made-up status JSON").set_defaults(handler=command_sample)
+    commands.add_parser("paths", help="print the config and status file paths").set_defaults(handler=command_paths)
+
+    args = parser.parse_args(argv)
+    try:
+        args.handler(args)
+    except BrokenPipeError:
+        pass
+    except LockTimeout as error:
+        print(f"ai-usage: {error}", file=sys.stderr)
+        return 75
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

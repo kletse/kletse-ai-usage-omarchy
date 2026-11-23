@@ -1,0 +1,63 @@
+{
+  "schemaVersion": 1,
+  "id": "ward.ai-usage",
+  "name": "AI Usage",
+  "version": "1.0.0",
+  "author": "Ward Werbrouck",
+  "license": "MIT",
+  "description": "Claude Code and Codex subscription usage for several accounts at once, with an animated Claude mascot.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "AI Usage",
+    "description": "One number per Claude Code or Codex account in the bar; every limit, and when it resets, in the panel.",
+    "category": "AI",
+    "aliases": [
+      "ai-usage",
+      "claude",
+      "codex",
+      "usage"
+    ],
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "refreshIntervalSec": 300,
+      "colorMascot": true,
+      "animations": true,
+      "renewClaude": true
+    },
+    "schema": [
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Refresh interval (seconds)",
+        "min": 60,
+        "max": 3600,
+        "step": 60,
+        "defaultValue": 300
+      },
+      {
+        "key": "colorMascot",
+        "type": "boolean",
+        "label": "Claude mascot in color (off: the bar's text color)",
+        "defaultValue": true
+      },
+      {
+        "key": "animations",
+        "type": "boolean",
+        "label": "Animate the mascots when usage changes, and now and then",
+        "defaultValue": true
+      },
+      {
+        "key": "renewClaude",
+        "type": "boolean",
+        "label": "Renew Claude logins shortly before their access tokens expire",
+        "defaultValue": true
+      }
+    ]
+  }
+}
